@@ -71,6 +71,10 @@ interface ConnectionNode {
   name: string;
   type: DbType;
   host: string;
+  config: DbConnectionConfig;
+  runtimeId?: string | null;
+  status?: 'idle' | 'connecting' | 'connected' | 'error';
+  lastError?: string;
   expanded: boolean;
   databases: DatabaseNode[];
 }
@@ -211,9 +215,10 @@ const App = () => {
     password: '',
   });
   const [connectionStep, setConnectionStep] = useState<'select' | 'form'>('select');
+  const [editingConnectionId, setEditingConnectionId] = useState<string | null>(null);
   const [designTableData, setDesignTableData] = useState<{name: string, columns: ColumnDefinition[]}>({ name: '', columns: [] });
   const [activeDesignTab, setActiveDesignTab] = useState('字段'); // Design Table Tabs
-  
+
   const [contextMenu, setContextMenu] = useState<{x:number, y:number, visible:boolean, type:string, targetId:string|null}>({x:0, y:0, visible:false, type:'root', targetId:null});
   const [aiConfig, setAiConfig] = useState<{ provider: AiProvider; model: string; temperature: number; baseUrl: string; apiKey: string }>({ provider: 'google', model: AI_DEFAULT_MODELS.google, temperature: 0.4, baseUrl: '', apiKey: '' });
   const [newTableForm, setNewTableForm] = useState({ name: '', columns: [{ name: 'id', type: 'BIGINT', length: undefined as number | undefined, decimal: undefined as number | undefined, notNull: true, virtual: false, isKey: true, comment: '' }] });
@@ -222,6 +227,8 @@ const App = () => {
   const dbAiInputRef = useRef<HTMLInputElement>(null);
   const sqlInputRef = useRef<HTMLTextAreaElement>(null);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const [isTestingConn, setIsTestingConn] = useState(false);
+  const [isLoadingSchema, setIsLoadingSchema] = useState(false);
 
   const ai = useMemo(() => {
     if (aiConfig.provider !== 'google') return null;
@@ -302,18 +309,24 @@ const App = () => {
 
   useEffect(() => {
     if (isDesktop && activeConnectionId) {
-      setActiveDatabase(null);
-      loadSchemaForConnection(activeConnectionId);
+      const conn = findConnectionById(activeConnectionId);
+      if (conn?.expanded) {
+        setActiveDatabase(null);
+        loadSchemaForConnection(activeConnectionId);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeConnectionId]);
+  }, [activeConnectionId, connections, isDesktop]);
 
   // --- 核心逻辑: 数据库 ---
 
-  const loadSchemaForConnection = async (connId: string, dbName?: string) => {
+  const loadSchemaForConnection = async (connId: string, dbName?: string, runtimeIdOverride?: string | null) => {
     if (!isDesktop || !window.desktopAPI) return;
     try {
-      const res = await window.desktopAPI.listSchema({ connId, database: dbName });
+      setIsLoadingSchema(true);
+      const runtimeId = runtimeIdOverride || await ensureConnection(connId);
+      if (!runtimeId) return;
+      const res = await window.desktopAPI.listSchema({ connId: runtimeId, database: dbName });
       if (res?.databases) {
         setConnections(prev => prev.map(c => {
           if (c.id !== connId) return c;
@@ -358,34 +371,46 @@ const App = () => {
       }
     } catch (error) {
       console.error('load schema failed', error);
+      setConnections(prev => prev.map(c => c.id === connId ? { ...c, status: 'error', lastError: (error as any)?.message } : c));
+      alert(`加载库结构失败: ${(error as any)?.message || error}`);
+    } finally {
+      setIsLoadingSchema(false);
     }
   };
 
   const handleCreateConnection = async () => {
     if (isDesktop && window.desktopAPI) {
       try {
-        const created = await window.desktopAPI.connect(connectionForm);
-        setConnections(prev => [...prev, {
-          id: created.id,
+        const created = await window.desktopAPI.connect({ ...connectionForm, port: connectionForm.port || DEFAULT_PORT[connectionForm.type] });
+        const newId = created.id;
+        const newConn: ConnectionNode = {
+          id: newId,
+          runtimeId: created.id,
           name: created.name,
           type: created.type,
           host: created.host,
           expanded: true,
-          databases: []
-        }]);
-        setActiveConnectionId(created.id);
+          databases: [],
+          config: { ...connectionForm },
+          status: 'connected'
+        };
+        setConnections(prev => [...prev, newConn]);
+        setActiveConnectionId(newId);
         setModals(m => ({ ...m, newConn: false }));
         setConnectionStep('select');
+        setEditingConnectionId(null);
         setActiveDatabase(null);
         setActiveTable(null);
-        await loadSchemaForConnection(created.id);
+        await loadSchemaForConnection(newId, undefined, created.id);
       } catch (e: any) {
         alert(`连接失败: ${e.message || e}`);
       }
       return;
     }
-    setConnections(p=>[...p, {id:Date.now().toString(), name:connectionForm.name || 'New Connection', type:connectionForm.type, host:connectionForm.host, expanded:true, databases:[]}]);
+    const fallbackId = Date.now().toString();
+    setConnections(p=>[...p, {id:fallbackId, runtimeId: fallbackId, name:connectionForm.name || 'New Connection', type:connectionForm.type, host:connectionForm.host, expanded:true, databases:[], config: { ...connectionForm }, status: 'connected'}]);
     setModals(m=>({...m, newConn:false}));
+    setEditingConnectionId(null);
   };
 
   const handleCreateTable = async () => {
@@ -437,7 +462,9 @@ const App = () => {
       if (!sql) return;
 
       if (isDesktop && activeConnectionId && window.desktopAPI) {
-        const res = await window.desktopAPI.runQuery({ connId: activeConnectionId, sql, database: targetDb });
+        const runtimeId = await ensureConnection(activeConnectionId);
+        if (!runtimeId) throw new Error('连接不可用，请先展开并重新连接。');
+        const res = await window.desktopAPI.runQuery({ connId: runtimeId, sql, database: targetDb });
         if (res.error) throw new Error(res.error);
         setResults({ headers: res.headers, rows: res.rows, error: null });
         setActiveTab('results');
@@ -493,7 +520,8 @@ const App = () => {
 
   const saveConnectionsToStorage = (data: ConnectionNode[]) => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      const sanitized = data.map(({ runtimeId, status, lastError, ...rest }) => ({ ...rest }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
     } catch (e) {
       console.warn('save connections failed', e);
     }
@@ -504,7 +532,29 @@ const App = () => {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed as ConnectionNode[];
+      if (Array.isArray(parsed)) {
+        return (parsed as any[]).map((c) => {
+          const type = (c.type || 'mysql') as DbType;
+          const baseConfig: DbConnectionConfig = c.config || {
+            name: c.name || '未命名连接',
+            type,
+            host: c.host || '',
+            port: c.port || DEFAULT_PORT[type],
+            user: c.user || '',
+            password: c.password || ''
+          };
+          return {
+            ...c,
+            type,
+            config: baseConfig,
+            expanded: false,
+            databases: [],
+            runtimeId: null,
+            status: 'idle',
+            lastError: undefined
+          } as ConnectionNode;
+        });
+      }
     } catch (e) {
       console.warn('load connections failed', e);
     }
@@ -545,6 +595,43 @@ const App = () => {
       return JSON.parse(raw) as { isDark: boolean; accent: AccentColor };
     } catch (e) {
       console.warn('load theme failed', e);
+      return null;
+    }
+  };
+
+  const findConnectionById = (connId: string | null) => {
+    if (!connId) return null;
+    return connections.find(c => c.id === connId || c.runtimeId === connId) || null;
+  };
+
+  const ensureConnection = async (connId: string | null) => {
+    const target = findConnectionById(connId);
+    if (!target) return null;
+    if (!isDesktop || !window.desktopAPI) return target.runtimeId || target.id;
+    if (target.runtimeId) return target.runtimeId;
+
+    const cfg = target.config || {
+      name: target.name,
+      type: target.type,
+      host: target.host,
+      port: DEFAULT_PORT[target.type],
+      user: '',
+      password: ''
+    };
+
+    if (!cfg.host || !cfg.user) {
+      alert('连接信息不完整，请编辑后再重试。');
+      return null;
+    }
+
+    setConnections(prev => prev.map(c => c.id === target.id ? { ...c, status: 'connecting', lastError: undefined } : c));
+    try {
+      const created = await window.desktopAPI.connect({ ...cfg, port: cfg.port || DEFAULT_PORT[cfg.type], name: cfg.name || target.name });
+      setConnections(prev => prev.map(c => c.id === target.id ? { ...c, runtimeId: created.id, name: created.name || target.name, host: created.host || target.host, status: 'connected' } : c));
+      return created.id;
+    } catch (e: any) {
+      setConnections(prev => prev.map(c => c.id === target.id ? { ...c, status: 'error', lastError: e?.message || '连接失败' } : c));
+      alert(`连接失败: ${e?.message || e}`);
       return null;
     }
   };
@@ -779,6 +866,90 @@ const App = () => {
     }));
   };
 
+  const handleConnectionToggle = async (conn: ConnectionNode) => {
+    const nextExpanded = !conn.expanded;
+    setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, expanded: nextExpanded } : c));
+    setActiveConnectionId(conn.id);
+    if (nextExpanded) {
+      const runtimeId = await ensureConnection(conn.id);
+      if (runtimeId) {
+        await loadSchemaForConnection(conn.id, undefined, runtimeId);
+      } else {
+        setConnections(prev => prev.map(c => c.id === conn.id ? { ...c, expanded: false } : c));
+      }
+    }
+  };
+
+  const handleTestConnection = async () => {
+    const cfg = { ...connectionForm, port: connectionForm.port || DEFAULT_PORT[connectionForm.type] };
+    if (!cfg.host || !cfg.user) {
+      alert('请填写主机和用户名');
+      return;
+    }
+    setIsTestingConn(true);
+    try {
+      if (isDesktop && window.desktopAPI) {
+        const temp = await window.desktopAPI.connect({ ...cfg, name: cfg.name || '连接测试' });
+        if (window.desktopAPI.close) {
+          await window.desktopAPI.close({ connId: temp.id });
+        }
+        alert('连接成功');
+      } else {
+        alert('连接测试仅在桌面端可用');
+      }
+    } catch (e: any) {
+      alert(`连接失败: ${e?.message || e}`);
+    } finally {
+      setIsTestingConn(false);
+    }
+  };
+
+  const openEditConnection = (connId: string) => {
+    const target = findConnectionById(connId);
+    if (!target) return;
+    const cfg = target.config || {
+      name: target.name,
+      type: target.type,
+      host: target.host,
+      port: DEFAULT_PORT[target.type],
+      user: '',
+      password: ''
+    };
+    setConnectionForm(cfg);
+    setEditingConnectionId(connId);
+    setConnectionStep('form');
+    setModals(m => ({ ...m, newConn: true }));
+  };
+
+  const handleSaveConnection = async () => {
+    if (editingConnectionId) {
+      const updatedCfg = { ...connectionForm };
+      setConnections(prev => prev.map(c => c.id === editingConnectionId ? {
+        ...c,
+        name: updatedCfg.name || c.name,
+        type: updatedCfg.type,
+        host: updatedCfg.host,
+        config: { ...updatedCfg, name: updatedCfg.name || c.name },
+        runtimeId: null,
+        status: 'idle',
+        lastError: undefined,
+        expanded: false,
+        databases: []
+      } : c));
+      setModals(m => ({ ...m, newConn: false }));
+      setConnectionStep('select');
+      setActiveConnectionId(editingConnectionId);
+      const runtimeId = await ensureConnection(editingConnectionId);
+      if (runtimeId) {
+        setConnections(prev => prev.map(c => c.id === editingConnectionId ? { ...c, expanded: true } : c));
+        await loadSchemaForConnection(editingConnectionId, undefined, runtimeId);
+      }
+      setEditingConnectionId(null);
+      return;
+    }
+    await handleCreateConnection();
+  };
+
   const handleGenerateMockData = async (tableName: string) => {
     setIsDbAiThinking(true);
     try {
@@ -976,7 +1147,7 @@ const App = () => {
                   className={`flex items-center gap-2 px-3 py-2 rounded-md cursor-pointer group select-none transition-colors text-sm
                     ${isDark ? 'hover:bg-[#1e293b] text-slate-300' : 'hover:bg-gray-200 text-slate-700'}
                   `}
-                onClick={() => { setActiveConnectionId(conn.id); toggleNode('conn', conn.id); }}
+                onClick={() => handleConnectionToggle(conn)}
                 onContextMenu={(e) => {e.preventDefault(); e.stopPropagation(); setContextMenu({x:e.clientX, y:e.clientY, visible:true, type:'connection', targetId:conn.id})}}
               >
                 {conn.expanded ? <ChevronDown size={14} className="opacity-50"/> : <ChevronRight size={14} className="opacity-50"/>}
@@ -1014,28 +1185,28 @@ const App = () => {
                           {db.tablesExpanded ? <ChevronDown size={12}/> : <ChevronRight size={12}/>}
                           Tables
                        </div>
-                       {db.tablesExpanded && db.tables.map(table => (
-                          <div 
-                            key={table} 
-                            className={`ml-5 flex items-center gap-2 px-3 py-2 rounded-md cursor-pointer text-sm transition-all mb-0.5
+                   {db.tablesExpanded && db.tables.map(table => (
+                      <div 
+                        key={table} 
+                        className={`ml-5 flex items-center gap-2 px-3 py-2 rounded-md cursor-pointer text-sm transition-all mb-0.5
                               ${activeTable === table && activeType === 'table'
                                 ? `${colors.bgSoft} ${colors.text} font-medium` 
                                 : `${isDark ? 'text-slate-500 hover:text-slate-300 hover:bg-white/5' : 'text-slate-500 hover:text-slate-800 hover:bg-gray-100'}`
                               }`}
-                            onClick={() => { 
-                              setActiveDatabase(db.name); 
-                              setActiveTable(table); 
-                              setActiveType('table'); 
-                              const sqlText = `SELECT * FROM ${table}`;
-                              setQuery(sqlText); 
-                              runQuery(sqlText, db.name);
-                            }}
-                            onContextMenu={(e) => {e.preventDefault(); e.stopPropagation(); setContextMenu({x:e.clientX, y:e.clientY, visible:true, type:'table', targetId:table})}}
-                          >
-                            <Table size={14} className={activeTable === table ? 'opacity-100' : 'opacity-50'} />
-                            <span className="truncate">{table}</span>
-                          </div>
-                       ))}
+                       onClick={() => { 
+                         setActiveDatabase(db.name); 
+                         setActiveTable(table); 
+                         setActiveType('table'); 
+                         const sqlText = `SELECT * FROM ${table}`;
+                         setQuery(sqlText); 
+                         runQuery(sqlText, db.name);
+                       }}
+                        onContextMenu={(e) => {e.preventDefault(); e.stopPropagation(); setContextMenu({x:e.clientX, y:e.clientY, visible:true, type:'table', targetId:table})}}
+                     >
+                       <Table size={14} className={activeTable === table ? 'opacity-100' : 'opacity-50'} />
+                       <span className="truncate">{table}</span>
+                     </div>
+                   ))}
 
                        {/* Collapsible Views List */}
                        <div 
@@ -1723,16 +1894,34 @@ const App = () => {
       {/* Context Menu */}
       {contextMenu.visible && (
         <div className={`fixed z-50 py-1 rounded-lg border shadow-xl w-48 text-sm animate-fade-in ${isDark ? 'bg-[#1e293b] border-white/10' : 'bg-white border-gray-200'}`} style={{left: contextMenu.x, top: contextMenu.y}} onClick={e => e.stopPropagation()}>
-           {contextMenu.type === 'root' && <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {setConnectionStep('select'); setModals(m=>({...m, newConn:true})); setContextMenu(p=>({...p, visible:false}))}}><Plus size={14}/> 新建连接</button>}
-           {contextMenu.type === 'connection' && <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {setModals(m=>({...m, newDb:true})); setContextMenu(p=>({...p, visible:false}))}}><Database size={14}/> 新建数据库</button>}
+           {contextMenu.type === 'root' && <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {
+             setEditingConnectionId(null);
+             setConnectionForm({ name: '本地连接', type: 'mysql', host: 'localhost', port: DEFAULT_PORT.mysql, user: 'root', password: '' });
+             setConnectionStep('select');
+             setModals(m=>({...m, newConn:true}));
+             setContextMenu(p=>({...p, visible:false}));
+           }}><Plus size={14}/> 新建连接</button>}
+           {contextMenu.type === 'connection' && (
+             <>
+               <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {if (contextMenu.targetId) openEditConnection(contextMenu.targetId); setContextMenu(p=>({...p, visible:false}))}}><Settings size={14}/> 编辑连接</button>
+               <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {setModals(m=>({...m, newDb:true})); setContextMenu(p=>({...p, visible:false}))}}><Database size={14}/> 新建数据库</button>
+             </>
+           )}
            {contextMenu.type === 'database' && (
              <>
-               <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {
-                 setNewTableTargetDbId(contextMenu.targetId);
-                 setNewTableForm({ name: '', columns: [{ name: 'id', type: 'BIGINT', length: undefined, decimal: undefined, notNull: true, virtual: false, isKey: true, comment: '' }] });
-                 setModals(m=>({...m, newTable:true}));
-                 setContextMenu(p=>({...p, visible:false}));
-               }}><Table size={14}/> 新建表</button>
+              <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={async () => {
+                if (contextMenu.targetId) {
+                  const found = connections.flatMap(c => c.databases.map(d => ({...d, connId: c.id}))).find(d => d.id === contextMenu.targetId);
+                  if (found) await loadSchemaForConnection(found.connId, found.name);
+                }
+                setContextMenu(p=>({...p, visible:false}));
+              }}><RefreshCcw size={14}/> 刷新库结构</button>
+              <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {
+                setNewTableTargetDbId(contextMenu.targetId);
+                setNewTableForm({ name: '', columns: [{ name: 'id', type: 'BIGINT', length: undefined, decimal: undefined, notNull: true, virtual: false, isKey: true, comment: '' }] });
+                setModals(m=>({...m, newTable:true}));
+                setContextMenu(p=>({...p, visible:false}));
+              }}><Table size={14}/> 新建表</button>
                <button className="w-full text-left px-4 py-2 hover:bg-white/10 flex items-center gap-2" onClick={() => {setModals(m=>({...m, erDiagram:true})); setContextMenu(p=>({...p, visible:false}))}}><Network size={14}/> 生成 ER 图</button>
              </>
            )}
@@ -1758,11 +1947,15 @@ const App = () => {
       {/* Simple Modals for New Table/Conn/etc (Simplified styles) */}
       {modals.newConn && (
          <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center backdrop-blur-sm">
-            <div className={`p-6 rounded-xl border w-[520px] max-h-[80vh] ${isDark ? 'bg-[#0f172a] border-white/10' : 'bg-white'}`}>
-               <div className="flex items-center justify-between mb-4">
-                 <h3 className="font-bold text-lg">新建连接</h3>
-                 <div className="text-xs opacity-70">{connectionStep === 'select' ? '选择数据库类型' : '填写连接信息'}</div>
+            <div className={`p-0 rounded-2xl border w-[560px] max-h-[82vh] overflow-hidden shadow-2xl ${isDark ? 'bg-[#0b1220] border-white/10' : 'bg-white border-gray-200'}`}>
+               <div className="p-4 bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 text-white flex items-center justify-between">
+                 <div>
+                   <div className="text-xs opacity-90">{connectionStep === 'select' ? '选择数据库类型' : '填写连接信息'}</div>
+                   <h3 className="font-bold text-lg mt-0.5">{editingConnectionId ? '编辑连接' : '新建连接'}</h3>
+                 </div>
+                 <div className="text-xs bg-white/20 px-3 py-1 rounded-full backdrop-blur-sm">桌面端直连数据库</div>
                </div>
+               <div className="p-6 space-y-4">
 
                {connectionStep === 'select' && (
                  <div className="grid grid-cols-2 gap-3">
@@ -1786,53 +1979,81 @@ const App = () => {
                )}
 
                {connectionStep === 'form' && (
-                 <div className="space-y-3">
+                 <div className="space-y-4">
                    <div className="flex items-center justify-between">
                      <div className="text-sm opacity-70">类型：{connectionForm.type.toUpperCase()}</div>
-                     <button className="text-xs opacity-60 hover:opacity-100" onClick={() => setConnectionStep('select')}>重新选择</button>
-                   </div>
-                   <input 
-                     className={`w-full p-2 rounded border outline-none ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50'}`} 
-                     placeholder="连接名称" 
-                     value={connectionForm.name}
-                     onChange={e => setConnectionForm(f => ({...f, name: e.target.value}))}
-                   />
-                   <div className="grid grid-cols-2 gap-3">
-                     <input 
-                       className={`w-full p-2 rounded border outline-none ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50'}`} 
-                       placeholder="主机 / IP" 
-                       value={connectionForm.host}
-                       onChange={e => setConnectionForm(f => ({...f, host: e.target.value}))}
-                     />
-                     <input 
-                       className={`w-full p-2 rounded border outline-none ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50'}`} 
-                       placeholder="端口" 
-                       value={connectionForm.port ?? ''} 
-                       onChange={e => setConnectionForm(f => ({...f, port: Number(e.target.value)}))}
-                     />
+                     {!editingConnectionId && <button className="text-xs opacity-60 hover:opacity-100" onClick={() => setConnectionStep('select')}>重新选择</button>}
                    </div>
                    <div className="grid grid-cols-2 gap-3">
-                     <input 
-                       className={`w-full p-2 rounded border outline-none ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50'}`} 
-                       placeholder="用户名" 
-                       value={connectionForm.user}
-                       onChange={e => setConnectionForm(f => ({...f, user: e.target.value}))}
-                     />
-                     <input 
-                       className={`w-full p-2 rounded border outline-none ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50'}`} 
-                       placeholder="密码" 
-                       type="password"
-                       value={connectionForm.password}
-                       onChange={e => setConnectionForm(f => ({...f, password: e.target.value}))}
-                     />
+                     <div className="col-span-2 space-y-1">
+                       <label className="text-xs opacity-70">连接名称</label>
+                       <input 
+                         className={`w-full p-3 rounded-lg border outline-none shadow-inner ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50 border-gray-200'}`} 
+                         placeholder="例如：生产库 / 开发库" 
+                         value={connectionForm.name}
+                         onChange={e => setConnectionForm(f => ({...f, name: e.target.value}))}
+                       />
+                     </div>
+                     <div className="space-y-1">
+                       <label className="text-xs opacity-70">主机 / IP</label>
+                       <input 
+                         className={`w-full p-3 rounded-lg border outline-none shadow-inner ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50 border-gray-200'}`} 
+                         placeholder="localhost 或 192.168.x.x" 
+                         value={connectionForm.host}
+                         onChange={e => setConnectionForm(f => ({...f, host: e.target.value}))}
+                       />
+                     </div>
+                     <div className="space-y-1">
+                       <label className="text-xs opacity-70">端口</label>
+                       <input 
+                         className={`w-full p-3 rounded-lg border outline-none shadow-inner ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50 border-gray-200'}`} 
+                         placeholder={`${DEFAULT_PORT[connectionForm.type]}`} 
+                         value={connectionForm.port ?? ''} 
+                         onChange={e => setConnectionForm(f => ({...f, port: Number(e.target.value)}))}
+                       />
+                     </div>
+                     <div className="space-y-1">
+                       <label className="text-xs opacity-70">用户名</label>
+                       <input 
+                         className={`w-full p-3 rounded-lg border outline-none shadow-inner ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50 border-gray-200'}`} 
+                         placeholder="如 root" 
+                         value={connectionForm.user}
+                         onChange={e => setConnectionForm(f => ({...f, user: e.target.value}))}
+                       />
+                     </div>
+                     <div className="space-y-1">
+                       <label className="text-xs opacity-70">密码</label>
+                       <input 
+                         className={`w-full p-3 rounded-lg border outline-none shadow-inner ${isDark ? 'bg-black/20 border-white/10' : 'bg-gray-50 border-gray-200'}`} 
+                         placeholder="数据库密码" 
+                         type="password"
+                         value={connectionForm.password}
+                         onChange={e => setConnectionForm(f => ({...f, password: e.target.value}))}
+                       />
+                     </div>
                    </div>
-                   <p className="text-xs opacity-70">无需输入数据库，提交后会自动列出所有数据库。</p>
+                   <div className="text-xs opacity-70 flex items-center justify-between">
+                     <span>无需填写数据库名，保存后会自动列出。</span>
+                     <span className="flex items-center gap-2">{editingConnectionId ? '保存后自动重连' : '创建后自动连通'}</span>
+                   </div>
+                   <div className="flex items-center gap-2 justify-between">
+                     <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg ${isDark ? 'bg-white/5 text-slate-300' : 'bg-blue-50 text-slate-700'}`}>
+                       <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"/>
+                       <span>填写完成后可先测试，不会保存连接。</span>
+                     </div>
+                     <button onClick={handleTestConnection} disabled={isTestingConn} className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 ${isTestingConn ? 'opacity-50 cursor-not-allowed' : `${colors.bg} text-white shadow`}`}>
+                       <Loader2 size={14} className={isTestingConn ? 'animate-spin' : 'hidden'} />
+                       {!isTestingConn && <Play size={14} />}
+                       测试连接
+                     </button>
+                   </div>
                  </div>
-               )}
+                )}
                <div className="flex justify-end gap-2 mt-4">
-                  <button onClick={()=>{setModals(m=>({...m, newConn:false})); setConnectionStep('select');}} className="px-3 py-1.5 text-sm opacity-60">取消</button>
-                  {connectionStep === 'form' && <button onClick={handleCreateConnection} className={`px-3 py-1.5 text-sm text-white rounded ${colors.bg}`}>创建</button>}
+                  <button onClick={()=>{setModals(m=>({...m, newConn:false})); setConnectionStep('select'); setEditingConnectionId(null);}} className="px-3 py-2 text-sm opacity-70 hover:opacity-100">取消</button>
+                  {connectionStep === 'form' && <button onClick={handleSaveConnection} className={`px-4 py-2 text-sm text-white rounded-lg shadow ${colors.bg}`}>{editingConnectionId ? '保存并重连' : '创建并连接'}</button>}
                </div>
+             </div>
             </div>
          </div>
       )}
