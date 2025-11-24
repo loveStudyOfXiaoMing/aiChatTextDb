@@ -8,12 +8,14 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "electron": "ELECTRON_START_URL=http://localhost:5173 electron electron/main.cjs",
+    "electron": "cross-env ELECTRON_START_URL=http://localhost:3000 electron electron/main.cjs",
     "desktop:dev": "concurrently -k \"npm run dev\" \"npm run electron\"",
     "desktop:build": "npm run build && electron-builder"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
+    "antd": "^6.0.0",
+    "echarts": "^6.0.0",
     "lucide-react": "^0.554.0",
     "mssql": "^9.3.1",
     "mysql2": "^3.11.3",
@@ -25,6 +27,7 @@
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
     "concurrently": "^8.2.2",
+    "cross-env": "^10.1.0",
     "electron": "^33.2.0",
     "electron-builder": "^24.13.3",
     "typescript": "~5.8.2",
