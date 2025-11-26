@@ -14,9 +14,11 @@
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
+    "@monaco-editor/react": "^4.7.0",
     "antd": "^6.0.0",
     "echarts": "^6.0.0",
     "lucide-react": "^0.554.0",
+    "monaco-editor": "^0.53.0",
     "mssql": "^9.3.1",
     "mysql2": "^3.11.3",
     "pg": "^8.13.1",
@@ -34,15 +36,17 @@
     "vite": "^6.2.0"
   },
   "build": {
-    "appId": "com.novadb.app",
-    "productName": "NovaDB",
+    "appId": "com.sqlsense.app",
+    "productName": "SQLSense",
+    "icon": "public/static/icon.png",
     "directories": {
       "buildResources": "assets"
     },
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "public/static/icon.png"
     ],
     "asar": true,
     "mac": {
@@ -52,10 +56,16 @@
       ]
     },
     "win": {
+      "icon": "public/static/icon.png",
       "target": [
         "nsis",
         "zip"
       ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
     },
     "extraMetadata": {
       "main": "electron/main.cjs"
